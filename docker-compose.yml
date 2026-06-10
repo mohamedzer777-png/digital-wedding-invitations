@@ -1,0 +1,63 @@
+# NOTE: Docker is OPTIONAL. The primary local-dev path installs SQL Server
+# natively (see README). This file is here for whoever does have Docker later.
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: inviteflow-mssql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Your_password123"
+      MSSQL_PID: Express
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssqldata:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q \"SELECT 1\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: inviteflow-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: inviteflow-backend
+    restart: unless-stopped
+    depends_on:
+      mssql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      # The `inviteflow` database must exist first (one-time):
+      #   docker exec inviteflow-mssql /opt/mssql-tools18/bin/sqlcmd -S localhost \
+      #     -U sa -P "Your_password123" -C -Q "IF DB_ID('inviteflow') IS NULL CREATE DATABASE inviteflow"
+      DATABASE_URL: "sqlserver://mssql:1433;database=inviteflow;user=sa;password=Your_password123;encrypt=true;trustServerCertificate=true"
+      REDIS_URL: redis://redis:6379
+    env_file:
+      - ./backend/.env
+    ports:
+      - "4000:4000"
+    # The backend image runs migrations on boot, then starts the API.
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+
+volumes:
+  mssqldata:
+  redisdata:

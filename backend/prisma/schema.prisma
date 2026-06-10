@@ -1,0 +1,275 @@
+// InviteFlow — Digital Wedding Invitation SaaS
+// Multi-tenant schema (shared DB / shared schema). Every tenant-owned row is
+// reachable from a User via `ownerId` directly or through its parent Event.
+//
+// ── SQL Server notes ────────────────────────────────────────────────────────
+// The Prisma SQL Server connector has constraints we design around here:
+//   • No native `enum`  → enum-like fields are `String` (allowed values live in
+//                          src/lib/enums.ts for application-level type safety).
+//   • No `Json` type    → JSON documents are stored as NVARCHAR(MAX) text and
+//                          (de)serialized in the service layer.
+//   • Index key ≤ 1700 B → every id / FK / indexed string column has a bounded
+//                          length (cuid ids use NVarChar(30)).
+//   • No multiple cascade paths → secondary FKs that would create a second
+//                          cascade path (Message→Guest, AnalyticsEvent→Guest)
+//                          use NoAction; those deletes are handled in services.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────────── Accounts / Billing ─────────────────────────────
+
+model User {
+  id           String @id @default(cuid()) @db.NVarChar(30)
+  email        String @unique @db.NVarChar(255)
+  passwordHash String @db.NVarChar(255)
+  name         String @db.NVarChar(150)
+  role         String @default("USER") @db.NVarChar(20) // Role enum (see enums.ts)
+  status       String @default("ACTIVE") @db.NVarChar(20) // UserStatus enum
+
+  events        Event[]
+  templates     Template[]     @relation("TemplateCreator")
+  subscription  Subscription?
+  refreshTokens RefreshToken[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([role])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid()) @db.NVarChar(30)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String    @db.NVarChar(30)
+  tokenHash String    @unique @db.NVarChar(255) // store only a hash of the refresh token
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model Plan {
+  id         String  @id @default(cuid()) @db.NVarChar(30)
+  name       String  @unique @db.NVarChar(100) // e.g. "Free", "Pro", "Business"
+  priceCents Int     @default(0)
+  currency   String  @default("USD") @db.NVarChar(10)
+  interval   String  @default("month") @db.NVarChar(10) // month | year
+  maxEvents  Int     @default(1)
+  maxGuests  Int     @default(50) // per event
+  features   String  @default("[]") @db.NVarChar(Max) // JSON string[] of feature flags
+  isActive   Boolean @default(true)
+
+  subscriptions Subscription[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("plans")
+}
+
+model Subscription {
+  id               String    @id @default(cuid()) @db.NVarChar(30)
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId           String    @unique @db.NVarChar(30)
+  plan             Plan      @relation(fields: [planId], references: [id]) // NoAction on SQL Server
+  planId           String    @db.NVarChar(30)
+  status           String    @default("TRIALING") @db.NVarChar(20) // SubscriptionStatus enum
+  currentPeriodEnd DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([planId])
+  @@map("subscriptions")
+}
+
+// ───────────────────────────── Events ─────────────────────────────
+
+model Event {
+  id          String    @id @default(cuid()) @db.NVarChar(30)
+  owner       User      @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId     String    @db.NVarChar(30)
+  title       String    @db.NVarChar(200)
+  type        String    @default("WEDDING") @db.NVarChar(20) // EventType enum
+  status      String    @default("DRAFT") @db.NVarChar(20) // EventStatus enum
+  description String?   @db.NVarChar(Max)
+  eventDate   DateTime?
+  venue       String?   @db.NVarChar(200)
+  location    String?   @db.NVarChar(500) // free-text address / map link
+  timezone    String    @default("UTC") @db.NVarChar(50)
+
+  invitation Invitation?
+  guests     Guest[]
+  messages   Message[]
+  reminders  Reminder[]
+  analytics  AnalyticsEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+  @@index([ownerId, status])
+  @@map("events")
+}
+
+model Template {
+  id        String  @id @default(cuid()) @db.NVarChar(30)
+  name      String  @db.NVarChar(150)
+  category  String  @default("classic") @db.NVarChar(50)
+  thumbnail String? @db.NVarChar(Max)
+  // Drag-and-drop layout document (JSON text): blocks, positions, fonts, colors.
+  design    String  @default("{}") @db.NVarChar(Max)
+  isPublic  Boolean @default(false) // true = system/global template
+  creator   User?   @relation("TemplateCreator", fields: [creatorId], references: [id], onDelete: SetNull)
+  creatorId String? @db.NVarChar(30)
+
+  invitations Invitation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creatorId])
+  @@index([isPublic])
+  @@map("templates")
+}
+
+model Invitation {
+  id         String    @id @default(cuid()) @db.NVarChar(30)
+  event      Event     @relation(fields: [eventId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  eventId    String    @unique @db.NVarChar(30)
+  template   Template? @relation(fields: [templateId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  templateId String?   @db.NVarChar(30)
+  // Rendered design document (JSON text). Mirrors Template.design.
+  design     String    @default("{}") @db.NVarChar(Max)
+  bodyText   String?   @db.NVarChar(Max) // AI-generated / user-edited invitation copy
+  status     String    @default("DRAFT") @db.NVarChar(20) // InvitationStatus enum
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([templateId])
+  @@map("invitations")
+}
+
+// ───────────────────────────── Guests / RSVP ─────────────────────────────
+
+model Guest {
+  id          String    @id @default(cuid()) @db.NVarChar(30)
+  event       Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId     String    @db.NVarChar(30)
+  name        String    @db.NVarChar(150)
+  phone       String    @db.NVarChar(30) // E.164 recommended, e.g. +9725...
+  email       String?   @db.NVarChar(255)
+  groupLabel  String?   @db.NVarChar(100) // e.g. "Bride's family", "Work"
+  partySize   Int       @default(1)
+  rsvpStatus  String    @default("PENDING") @db.NVarChar(20) // RsvpStatus enum
+  // Unguessable token powering the public RSVP link /rsvp/:token
+  rsvpToken   String    @unique @default(cuid()) @db.NVarChar(30)
+  respondedAt DateTime?
+  notes       String?   @db.NVarChar(Max)
+
+  messages  Message[]
+  analytics AnalyticsEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, phone]) // no duplicate phone within one event
+  @@index([eventId])
+  @@index([eventId, rsvpStatus])
+  @@map("guests")
+}
+
+// ───────────────────────────── Messaging ─────────────────────────────
+
+model Message {
+  id      String @id @default(cuid()) @db.NVarChar(30)
+  event   Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId String @db.NVarChar(30)
+  // NoAction avoids a second cascade path Event→Guest→Message (SQL Server limit).
+  // Deleting a single guest deletes its messages explicitly in the guest service.
+  guest   Guest  @relation(fields: [guestId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  guestId String @db.NVarChar(30)
+
+  channel       String    @default("WHATSAPP") @db.NVarChar(20) // MessageChannel enum
+  type          String    @default("INVITATION") @db.NVarChar(20) // MessageType enum
+  status        String    @default("QUEUED") @db.NVarChar(20) // MessageStatus enum
+  body          String?   @db.NVarChar(Max)
+  scheduledAt   DateTime?
+  sentAt        DateTime?
+  deliveredAt   DateTime?
+  readAt        DateTime?
+  providerMsgId String?   @db.NVarChar(255) // id returned by WhatsApp; matches webhooks
+  retryCount    Int       @default(0)
+  error         String?   @db.NVarChar(Max)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([eventId])
+  @@index([guestId])
+  @@index([status])
+  @@index([providerMsgId])
+  @@map("messages")
+}
+
+model Reminder {
+  id          String    @id @default(cuid()) @db.NVarChar(30)
+  event       Event     @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId     String    @db.NVarChar(30)
+  offsetHours Int // hours before eventDate, e.g. 24 or 3
+  enabled     Boolean   @default(true)
+  lastFiredAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([eventId, offsetHours])
+  @@index([eventId])
+  @@map("reminders")
+}
+
+// ───────────────────────────── Tracking ─────────────────────────────
+
+model AnalyticsEvent {
+  id      String @id @default(cuid()) @db.NVarChar(30)
+  event   Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId String @db.NVarChar(30)
+  // NoAction avoids a second cascade path Event→Guest→AnalyticsEvent.
+  guest   Guest? @relation(fields: [guestId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  guestId String? @db.NVarChar(30)
+
+  type      String   @db.NVarChar(30) // AnalyticsType enum
+  metadata  String   @default("{}") @db.NVarChar(Max) // JSON text
+  createdAt DateTime @default(now())
+
+  @@index([eventId, type])
+  @@index([eventId, createdAt])
+  @@map("analytics_events")
+}
+
+model WebhookEvent {
+  id          String    @id @default(cuid()) @db.NVarChar(30)
+  provider    String    @default("whatsapp") @db.NVarChar(50)
+  externalId  String?   @db.NVarChar(255) // provider event id, for idempotency
+  payload     String    @db.NVarChar(Max) // JSON text
+  processedAt DateTime?
+  error       String?   @db.NVarChar(Max)
+  createdAt   DateTime  @default(now())
+
+  // Plain index (not unique): SQL Server unique indexes allow only one NULL,
+  // so idempotency is enforced in the webhook service by checking externalId.
+  @@index([provider, externalId])
+  @@index([provider, processedAt])
+  @@map("webhook_events")
+}
