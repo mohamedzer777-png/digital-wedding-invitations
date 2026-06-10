@@ -11,9 +11,15 @@ import { adminRouter } from '../modules/admin/admin.routes.js';
 
 export const apiRouter = Router();
 
-// Liveness + DB readiness probe
+// Liveness probe — no external dependencies so the platform health check stays
+// green even if the DB is briefly unreachable. Render pings this to verify boot.
+apiRouter.get('/health', (_req, res) => {
+  res.status(200).send('OK');
+});
+
+// Readiness probe — verifies the DB connection is actually live.
 apiRouter.get(
-  '/health',
+  '/ready',
   asyncHandler(async (_req, res) => {
     await prisma.$queryRaw`SELECT 1`;
     res.json({ status: 'ok', time: new Date().toISOString() });

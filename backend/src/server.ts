@@ -7,8 +7,11 @@ import { startScheduler, stopScheduler } from './scheduler.js';
 async function main() {
   const app = createApp();
 
-  const server = app.listen(env.PORT, () => {
-    logger.info(`🚀 InviteFlow API listening on http://localhost:${env.PORT}/api`);
+  // Bind to 0.0.0.0 (all interfaces) so the platform's health checker can reach
+  // the service from outside the container, not just loopback. env.PORT reads
+  // process.env.PORT (injected by Render) and falls back to its configured default.
+  const server = app.listen(env.PORT, '0.0.0.0', () => {
+    logger.info(`🚀 InviteFlow API listening on http://0.0.0.0:${env.PORT}/api`);
     logger.info(`   Environment: ${env.NODE_ENV}`);
   });
 
